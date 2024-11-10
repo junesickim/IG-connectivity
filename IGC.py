@@ -489,7 +489,7 @@ def display_connectivity(conn, title='', vmin=0.0, vmax=1.0, labels=[]):
             mapper=axs[i].pcolor(labels, labels, con, shading='nearest', 
                                  vmin=vmin, vmax=vmax, cmap='Oranges')
             axs[i].axis('image')
-            axs[i].set_xticks(range(1,1+con.shape[0]))
+            axs[i].set_xticks(range(0,0+con.shape[0]))
             axs[i].set_xticklabels(labels, rotation=45)
             axs[i].set_title(subtitle)
         fig.colorbar(mapper, ax=axs, shrink=1/(len(conn)/2+2.5))
