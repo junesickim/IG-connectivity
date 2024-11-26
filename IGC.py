@@ -221,7 +221,7 @@ class MVAR_biLSTM(nn.Module):
         
         return out
 
-def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=512, device=None):
+def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=512, verbose=True, device=None):
     if device is None:
         device = ("cuda"
              if torch.cuda.is_available()
@@ -245,20 +245,21 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
         for b in range(total_batch):
             x_batch.append(x_train[b*n_batch:(b+1)*n_batch,:,:])
             y_batch.append(y_train[b*n_batch:(b+1)*n_batch,:])
-        dataset=zip(x_batch, y_batch)
     # CUDA timer
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    total_s = torch.cuda.Event(enable_timing=True)
+    total_e = torch.cuda.Event(enable_timing=True)
     train_hist = np.zeros(0)
     test_hist = np.zeros(0)
+    total_s.record()
     for epoch in range(num_epochs):
         start.record()
         avg_cost = 0.0
         model.train()
+        if not isinstance(trainset, torch.utils.data.DataLoader):
+            dataset=zip(x_batch, y_batch)
         for i, (x_part, y_part) in enumerate(dataset):
-            #x_part = x_part.to(device) # (BATCH(64), 10, 516)
-            #y_part = y_part.to(device) # Size : (64 x 3)
-
             # 순전파
             outputs = model(x_part.to(device))
             loss = criterion(outputs, y_part.to(device))
@@ -269,8 +270,6 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
             optimizer.step()
             avg_cost += loss.item()/total_batch
         train_hist = np.append(train_hist, avg_cost)
-        end.record()
-        torch.cuda.synchronize()
 
         if len(testset)>0:
             #testout = model(x_test.to(device))
@@ -278,8 +277,13 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
                                               nbatch=n_batch, device=device)
             #tloss=testloss(testout, ytest.to(device))
             test_hist = np.append(test_hist, tloss)
-            print('Epoch [{}/{}]  Train_loss: {:.5f}  Test_loss: {:.5f}  Elapsed: {:.3f}s'.format(
-                epoch+1, num_epochs, avg_cost, tloss, start.elapsed_time(end)/1000))
+            end.record()
+            torch.cuda.synchronize()
+            if verbose:
+                print('Epoch [{}/{}]  Train_loss: {:.5f}  Test_loss: {:.5f}  Elapsed: {:.3f}s'.format(
+                    epoch+1, num_epochs, avg_cost, tloss, start.elapsed_time(end)/1000))
+            else:
+                print('.', end='')
             if epoch>3:
                 # test loss가 3회 연속 증가하면 학습 중지
                 test_loss_increase=np.array([1 if dif>0 else 0 for dif in test_hist[-3:]-test_hist[-4:-1]])
@@ -287,9 +291,16 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
                     print('The model is being overfit. Iteration is terminated.')
                     break
         else:
-            print('Epoch [{}/{}]  Train_loss: {:.5f}  Elapsed: {:.3f}s'.format(
-                epoch+1, num_epochs, avg_cost, start.elapsed_time(end)/1000))
-        #torch.cuda.empty_cache()
+            end.record()
+            torch.cuda.synchronize()
+            if verbose:
+                print('Epoch [{}/{}]  Train_loss: {:.5f}  Elapsed: {:.3f}s'.format(
+                    epoch+1, num_epochs, avg_cost, start.elapsed_time(end)/1000))
+            else:
+                print('.',end='')
+    total_e.record()
+    torch.cuda.synchronize()
+    print('Total elapsed time for training: {:.3f}s'.format(total_s.elapsed_time(total_e)/1000))
     return train_hist, test_hist
 
 def evaluate_testset(model, testset, loss_func=None, nbatch=512, device=None):
@@ -336,8 +347,7 @@ def evaluation_corr(model, X, nbatch=512, device=None):
         for x_batch,y_batch in X:
             y_pred=torch.cat((y_pred,model(x_batch.to(device)).data.cpu()),dim=0)
     else:
-        y=X[1]
-        x=X[0]
+        x,y=X
         y_pred=torch.zeros(0,y.shape[1])
         for i in range(int(np.ceil(x.shape[0]/nbatch))):
             x_batch=x[i*nbatch:(i+1)*nbatch,:,:]
@@ -487,19 +497,22 @@ def display_connectivity(conn, title='', vmin=0.0, vmax=1.0, labels=[]):
         fig.set_size_inches(4+2*len(conn),10)
         for i, (con, subtitle) in enumerate(zip(conn, title)):
             mapper=axs[i].pcolor(labels, labels, con, shading='nearest', 
-                                 vmin=vmin, vmax=vmax, cmap='Oranges')
+                                 vmin=vmin, vmax=vmax, cmap='gist_heat_r')
             axs[i].axis('image')
-            axs[i].set_xticks(range(0,0+con.shape[0]))
-            axs[i].set_xticklabels(labels, rotation=45)
+            axs[i].set_xticks(np.arange(1,1+con.shape[0], np.ceil(con.shape[0]/10), dtype=int))
+            axs[i].set_xticklabels(range(1, nch+1, int(np.ceil(nch/10))), rotation=45)
+            axs[i].set_xlabel('From')
             axs[i].set_title(subtitle)
+        axs[0].set_ylabel('To')
         fig.colorbar(mapper, ax=axs, shrink=1/(len(conn)/2+2.5))
-        #fig.show()
     else:
         nch = conn.shape[0]
         if len(labels)!=nch:
             labels = range(1,nch+1)
-        plt.pcolor(labels, labels, conn, shading='nearest', vmin=vmin, vmax=vmax, cmap='Oranges')
+        plt.pcolor(labels, labels, conn, shading='nearest', vmin=vmin, vmax=vmax, cmap='gist_heat_r')
         plt.xticks(rotation=45)
+        plt.xlabel('From')
+        plt.ylabel('To')
         plt.colorbar()
         plt.title(title)
     plt.show()
