@@ -40,7 +40,8 @@ Stay tuned for updates!
 
 If you use this code in your work, please cite the paper as follows (citation details to be updated once the paper is published):
 ```
-Author Names, "Title of the Paper," Computers in Biology and Medicine, Year.
+June Sic Kim, "A novel approach for brain connectivity using recurrent neural networks and integrated gradients," Computers in Biology and Medicine, 2025, 184:109404.
+https://doi.org/10.1016/j.compbiomed.2024.109404
 ```
 
 ## Contributing
