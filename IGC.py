@@ -97,13 +97,39 @@ def get_gradients(model, inputs):
 
     return grads
 
-def get_integrated_gradients(model, x, baseline=None, num_steps=50, side=2):
+def get_gradients_VF(model, inputs, verbose=True):
+    model.train(True)
+    for out_n in model.parameters():
+        model_outsize=out_n.shape
+    model_outsize=model_outsize[0]
+    device=next(model.parameters()).device
+    #grads=torch.zeros((len(inputs), inputs[0].shape[-2], inputs[0].shape[-1], model_outsize))
+    interp_input=torch.cat(inputs).float().requires_grad_(True)
+    y=model(interp_input.to(device))
+    # grads [batch, sequence, input, output]
+    grads = torch.zeros([y.shape[0], interp_input.shape[1], interp_input.shape[2], model_outsize])
+    # Compute gradients for all outputs at once
+    for i in range(model_outsize):
+        grad_outputs=torch.zeros_like(y)
+        grad_outputs[:,i]=1.0
+        grad = torch.autograd.grad(
+            outputs=y,
+            inputs=interp_input,
+            grad_outputs=grad_outputs,  # Sum gradients for all output dimensions
+            create_graph=False,
+            retain_graph=True
+        )[0]  # grads shape: (batch, sequence, input)
+        grads[:,:,:,i]=grad # grads shape: (batch, sequence, input, output)
+        if verbose and (i+1)%5==0: print('.',end='')
+    return grads.to('cpu')
+
+def get_integrated_gradients(model, x, baseline=None, num_grads=20, side=2, verbose=True):
     """
-    igs = get_integrated_gradients(model, x, baseline=None, num_steps=100)
+    igs = get_integrated_gradients(model, x, baseline=None, num_grads=100)
     model    : pytorch DNN model
     x        : reference input
     baseline : default (None) indicates 0
-    num_steps: number of steps from baseline to the reference input
+    num_grads: number of gradient steps from baseline to the reference input
     side     : if 1, only uses positive values (ex: images, min-max normalized signals)
                if 2, uses both of negative and positive values separately and merges both values
     """
@@ -116,12 +142,12 @@ def get_integrated_gradients(model, x, baseline=None, num_steps=50, side=2):
     x=x.float()
     inputs1=[]
     inputs2=[]
-    for step in range(1,num_steps+1):
-        interpolated_signal1=(baseline+(step/num_steps)*(x-baseline)).unsqueeze(0).clone().detach()
+    for step in range(1,num_grads+1):
+        interpolated_signal1=(baseline+(step/num_grads)*(x-baseline)).unsqueeze(0).clone().detach()
         interpolated_signal1.requires_grad_(True)
         inputs1.append(interpolated_signal1)
         if side==2:
-            interpolated_signal2=(baseline+(step/num_steps)*(-x-baseline)).unsqueeze(0).clone().detach()
+            interpolated_signal2=(baseline+(step/num_grads)*(-x-baseline)).unsqueeze(0).clone().detach()
             interpolated_signal2.requires_grad_(True)
             inputs2.append(interpolated_signal2)
     
@@ -132,7 +158,8 @@ def get_integrated_gradients(model, x, baseline=None, num_steps=50, side=2):
             child.p = 0
     
     # 3. Get gradients
-    grads1=get_gradients(n_model, inputs1)
+    #grads1=get_gradients(n_model, inputs1, verbose=verbose)
+    grads1=get_gradients_VF(n_model, inputs1, verbose=verbose)
     # Approximate the integral using the trapezoidal rule
     grads1 = (grads1[:-1] + grads1[1:]) / 2.0
     # 4. Calculate integrated gradients
@@ -140,7 +167,8 @@ def get_integrated_gradients(model, x, baseline=None, num_steps=50, side=2):
 
     if side==2:
         # For negative activity (Repeat 3~4)
-        grads2=get_gradients(n_model, inputs2)
+        #grads2=get_gradients(n_model, inputs2, verbose=verbose)
+        grads2=get_gradients_VF(n_model, inputs2, verbose=verbose)
         grads2 = (grads2[:-1] + grads2[1:]) / 2.0
         igs2 = (-x - baseline).squeeze().unsqueeze(2).repeat(1,1,grads2.shape[-1]) * grads2.mean(0)
     
@@ -149,6 +177,99 @@ def get_integrated_gradients(model, x, baseline=None, num_steps=50, side=2):
         igs = igs1
 
     return igs
+
+def ig_connectivity(x, model=None, order=20, num_grads=50, foi=torch.arange(0,100,5), sfreq=1000, stat='np', nrs=0, side=2, device=None):
+    """
+    Integrated Gradients connectivity
+    igc, igc_f = ig_connectivity(x, model=None, order=20, foi=torch.arange(0,100,10), sfreq=1000)
+        x     : 2D input tensor (N samples x M channels)
+        model : give a torch prediction model (if default None, the function uses a basic LSTM model)
+        order : order of a regression model (default=20)
+        num_grads: number of gradient steps from baseline to input
+        foi   : frequency of interest (default: 0~100)
+        sfreq : sampling frequency
+        stat  : statistics method. one of 'np' or 'pdc'
+                'np' means non-parametric statistics with pseudo-distribution (default)
+                'pdc' provides PDC and DTF normalization.
+        nrs   : number of random signals (default is zero)
+                It inserts additional random signals into 'x' so as to estimate random connectivity
+        device: 'cuda' or 'cpu'
+                If you don't provide anything, it tests whether CUDA is available.
+        ----
+        returns
+        igc   : connectivity between channels. 
+                Frequency-averaged representative connectivity (M,M)(columns cause rows)
+        cl    : Confidence level
+        igc_t : T-statistics
+        igc_p : P-value
+        igc_f : connectivity spectrum according to foi
+        igc_o : Predicted connected weights
+    """
+    if isinstance(x, torch.Tensor)==False:
+        print('Error: x should be a torch tensor')
+        return None, None
+    
+    if device is None:
+        device = ("cuda" if torch.cuda.is_available() else "cpu")
+    # Build a predefined model and train
+    if model is None:
+        # Add random signals for statistical inference
+        if (stat=='np' or stat=='NP'):
+            if nrs==0: nrs=int(np.ceil(x.shape[-1]*.1))
+            x = torch.cat([x, torch.randn(x.shape[0], nrs)], axis=1)
+        # Normalization of input data
+        for i in range(x.shape[1]):
+            x[:,i]=(x[:,i]-torch.mean(x[:,i]))/torch.std(x[:,i])/3.0
+        # Reconstruction of a dataset with (order) time steps (ex: 20)
+        x_train, y_train = multivariate_data(x, x, 0, int(x.shape[0]), order, 1, 1, True)
+        x_train = x_train.float()
+        y_train = y_train.float()
+        x_test, y_test = multivariate_data(x, x, int(x.shape[0]*0.8), x.shape[0], order, 1, 1, True)
+        x_test = x_test.float()
+        y_test = y_test.float()
+        model = MVAR_biLSTM(x.shape[-1], [200, 200, 200], 1, x.shape[-1]).to(device)
+        hist = train_model(model, (x_train, y_train), (x_test, y_test), num_epochs=50, device=device)
+        # Use a trained model
+        # Validation of model fitting
+        #pred_y=model(x_train.to(device))
+        pred_y = evaluate_testset(model, (x_train,y_train))
+        corr_train=torch.corrcoef(torch.concatenate(
+            (pred_y.reshape(1,-1),y_train.reshape(1,-1)),axis=0))
+        corr_train=corr_train.cpu().detach().numpy()
+        # Transform R to T
+        corr_t = corr_train[0,1]*np.sqrt(torch.numel(pred_y)-2)/np.sqrt(1-corr_train[0,1]**2)
+        # Estimate T to P
+        corr_p = 2*(1 - stats.t.cdf(np.abs(corr_t), torch.numel(pred_y)-2))
+        print("Train accuracy (CC) : %5.3f  (p=%7.5f)" %(corr_train[0,1], corr_p))
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    # Connectivity measure
+    ref = torch.ones((order, x.shape[-1]), dtype=torch.float)
+    igc = get_integrated_gradients(model, ref, num_grads=num_grads, side=side)
+    igc_pdc, igc_dtf, igc_f = igs_spectrum(igc, foi, sfreq, mode=2)
+    
+    igc_o = igc.transpose(1,2)
+    #igc = igc_f.mean(0)
+    igc = igc_f.max(0)[0]
+    if stat=='np' or stat=='NP':
+        pseudo_dist=torch.cat([igc[-nrs:,:].reshape(-1), igc[:-nrs,-nrs:].reshape(-1)], axis=0)
+        igc = igc[:-nrs,:-nrs]
+        #igc_o = igc_o[:,:-nrs,:-nrs]
+        igc_f = igc_f[:,:-nrs,:-nrs]
+        cl=pseudo_dist.mean()+stats.t.ppf(
+            0.01/igc.shape[0]**2/pseudo_dist.shape[0],pseudo_dist.shape[0]) * \
+            pseudo_dist.std()/np.sqrt(pseudo_dist.shape[0])
+        igc_t = (igc - pseudo_dist.mean())/torch.sqrt(pseudo_dist.var()/pseudo_dist.size(-1))
+        igc_p = 2*(1 - stats.t.cdf(igc_t, pseudo_dist.size(-1)-1))*igc.shape[0]**2
+        end.record()
+        torch.cuda.synchronize()
+        print('IGC computation time: %.3fs' %(start.elapsed_time(end)/1000))
+        return igc, (cl, pseudo_dist), igc_t, igc_p, igc_f, igc_o, foi
+
+    print('IGC computation time: %.3fs' %(start.elapsed_time(end)/1000))
+    return igc_pdc, igc_dtf, igc_o, igc, igc_f, foi
 
 def igs_spectrum(igs, foi=torch.arange(0,100,10), sfreq=100, mode=1):
     """
@@ -288,7 +409,7 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
                 # test loss가 3회 연속 증가하면 학습 중지
                 test_loss_increase=np.array([1 if dif>0 else 0 for dif in test_hist[-3:]-test_hist[-4:-1]])
                 if tloss > test_hist[max([epoch-3,0]):epoch].mean() and test_loss_increase.sum()>2:
-                    print('The model is being overfit. Iteration is terminated.')
+                    print('Early termination', end=' ')
                     break
         else:
             end.record()
@@ -300,7 +421,7 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
                 print('.',end='')
     total_e.record()
     torch.cuda.synchronize()
-    print('Total elapsed time for training: {:.3f}s'.format(total_s.elapsed_time(total_e)/1000))
+    print('(Total elapsed time: {:.3f}s)'.format(total_s.elapsed_time(total_e)/1000))
     return train_hist, test_hist
 
 def evaluate_testset(model, testset, loss_func=None, nbatch=512, device=None):
@@ -358,92 +479,6 @@ def evaluation_corr(model, X, nbatch=512, device=None):
     for i in range(y.shape[-1]):
         corr[i]=torch.corrcoef(torch.stack((y_pred[:,i].cpu(),y[:,i].cpu()),1).T)[0,1]
     return corr_total, corr
-
-def ig_connectivity(x, model=None, order=20, foi=torch.arange(0,100,5), sfreq=1000, stat='np', nrs=0, side=2, device=None):
-    """
-    Integrated Gradients connectivity
-    igc, igc_f = ig_connectivity(x, model=None, order=20, foi=torch.arange(0,100,10), sfreq=1000)
-        x     : 2D input tensor (N samples x M channels)
-        model : give a torch prediction model (if default None, the function uses a basic LSTM model)
-        order : order of a regression model (default=20)
-        foi   : frequency of interest (default: 0~100)
-        sfreq : sampling frequency
-        stat  : statistics method. one of 'np' or 'pdc'
-                'np' means non-parametric statistics with pseudo-distribution (default)
-                'pdc' provides PDC and DTF normalization.
-        nrs   : number of random signals (default is zero)
-                It inserts additional random signals into 'x' so as to estimate random connectivity
-        device: 'cuda' or 'cpu'
-                If you don't provide anything, it tests whether CUDA is available.
-        ----
-        returns
-        igc   : representative connectivity between channels
-        cl    : confidence level
-        igc_t : T statistics of IGC
-        igc_p : p-values of igc_t 
-        igc_f : connectivity spectrum according to foi
-        igc_o : original values of igc (time-series)
-        igc_pdc: normalized IGC like PDC
-        igc_dtf: noramlized IGC like DTF
-        foi   : frequency of interest
-    """
-    if isinstance(x, torch.Tensor)==False:
-        print('Error: x should be a torch tensor')
-        return None, None
-    
-    if device is None:
-        device = ("cuda" if torch.cuda.is_available() else "cpu")
-    # Build a predefined model and train
-    if model is None:
-        # Add random signals for statistical inference
-        if (stat=='np' or stat=='NP'):
-            if nrs==0: nrs=int(np.ceil(x.shape[-1]*.1))
-            x = torch.cat([x, torch.randn(x.shape[0], nrs)], axis=1)
-        # Normalization of input data
-        for i in range(x.shape[1]):
-            x[:,i]=(x[:,i]-torch.mean(x[:,i]))/torch.std(x[:,i])/3.0
-        # Reconstruction of a dataset with (order) time steps (ex: 20)
-        x_train, y_train = multivariate_data(x, x, 0, int(x.shape[0]), order, 1, 1, True)
-        x_train = x_train.float()
-        y_train = y_train.float()
-        x_test, y_test = multivariate_data(x, x, int(x.shape[0]*0.8), x.shape[0], order, 1, 1, True)
-        x_test = x_test.float()
-        y_test = y_test.float()
-        model = MVAR_biLSTM(x.shape[-1], [200, 200, 200], 1, x.shape[-1]).to(device)
-        hist = train_model(model, (x_train, y_train), (x_test, y_test), num_epochs=50, device=device)
-        # Use a trained model
-        # Validation of model fitting
-        #pred_y=model(x_train.to(device))
-        pred_y = evaluate_testset(model, (x_train,y_train))
-        corr_train=torch.corrcoef(torch.concatenate(
-            (pred_y.reshape(1,-1),y_train.reshape(1,-1)),axis=0))
-        corr_train=corr_train.cpu().detach().numpy()
-        # Transform R to T
-        corr_t = corr_train[0,1]*np.sqrt(torch.numel(pred_y)-2)/np.sqrt(1-corr_train[0,1]**2)
-        # Estimate T to P
-        corr_p = 2*(1 - stats.t.cdf(np.abs(corr_t), torch.numel(pred_y)-2))
-        print("Train accuracy (CC) : %5.3f  (p=%7.5f)" %(corr_train[0,1], corr_p))
-
-    # Connectivity measure
-    ref = torch.ones((order, x.shape[-1]), dtype=torch.float)
-    igc = get_integrated_gradients(model, ref, side=side)
-    igc_pdc, igc_dtf, igc_f = igs_spectrum(igc, foi, sfreq, mode=2)
-    
-    igc_o = igc.transpose(1,2)
-    igc = igc_f.mean(0)
-    if stat=='np' or stat=='NP':
-        pseudo_dist=torch.cat([igc[-nrs:,:].reshape(-1), igc[:-nrs,-nrs:].reshape(-1)], axis=0)
-        igc = igc[:-nrs,:-nrs]
-        igc_o = igc_o[:,:-nrs,:-nrs]
-        igc_f = igc_f[:,:-nrs,:-nrs]
-        cl=pseudo_dist.mean()-stats.t.ppf(
-            0.01/igc.shape[0]**2/pseudo_dist.shape[0],pseudo_dist.shape[0]) * \
-            pseudo_dist.std()/np.sqrt(pseudo_dist.shape[0])
-        igc_t = (igc - pseudo_dist.mean())/torch.sqrt(pseudo_dist.var()/pseudo_dist.size(-1))
-        igc_p = 2*(1 - stats.t.cdf(igc_t, pseudo_dist.size(-1)-1))*igc.shape[0]**2
-        return igc, cl, igc_t, igc_p, igc_f, igc_o, foi
-    
-    return igc_pdc, igc_dtf, igc_o, igc, igc_f, foi
 
 def display_conn_spectrum(conn, frq=None, title='', yscale=1.0, thresh=0):
     """
