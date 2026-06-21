@@ -1,6 +1,6 @@
 # Example Code Based on "A novel approach for brain connectivity using recurrent neural networks and integrated gradients" published in Computers in Biology and Medicine, and "Dynamic memory-enhanced recurrent neural networks with temporal attention for robust long-range connectivity inference" published in Neuroimage
 
-This repository contains example code that is based on a paper published in the journal **Computers in Biology and Medicine** and **Neuroimage**. The current files include a Python script (`IGC.py`) and a Jupyter Notebooks (`IGC_example.ipynb` and 'IGC_with_DM_example.ipynb') that demonstrate key methodologies introduced in the research.  
+This repository contains example code that is based on a paper published in the journal **Computers in Biology and Medicine** and **Neuroimage**. The current files include a Python script (`IGC.py`) and a Jupyter Notebooks (`IGC_example.ipynb`) and (`IGC_with_DM_example.ipynb`) that demonstrate key methodologies introduced in the research.  
 
 
 ## Overview
@@ -10,6 +10,7 @@ The code provided here demonstrates practical applications of the methods and te
 ### Files Included
 - **IGC.py**: This script contains core functions and implementations that are introduced in the paper.
 - **IGC_example.ipynb**: This Jupyter Notebook provides a hands-on example of how to use the functions and demonstrates their usage in different scenarios, complete with visualizations and explanations.
+- **IGC_with_DM_example.ipynb**: This Jupyter Notebook provides a hands-on example of how to use the functions and demonstrates usage of IGC with dynamic memory, complete with visualizations and explanations.
 
 ## Prerequisites
 
@@ -18,6 +19,7 @@ To run the code in this repository, the following Python packages are required:
 - `torch`
 - `matplotlib`
 - `scipy`
+- `sklearn`
 
 ## Usage
 
