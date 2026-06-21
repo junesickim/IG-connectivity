@@ -1,6 +1,7 @@
-# Example Code Based on "A novel approach for brain connectivity using recurrent neural networks and integrated gradients" published in Computers in Biology and Medicine
+# Example Code Based on "A novel approach for brain connectivity using recurrent neural networks and integrated gradients" published in Computers in Biology and Medicine, and "Dynamic memory-enhanced recurrent neural networks with temporal attention for robust long-range connectivity inference" published in Neuroimage
 
-This repository contains example code that is based on a paper published in the journal **Computers in Biology and Medicine**. The current files include a Python script (`IGC.py`) and a Jupyter Notebook (`IGC_example.ipynb`) that demonstrate key methodologies introduced in the research.
+This repository contains example code that is based on a paper published in the journal **Computers in Biology and Medicine** and **Neuroimage**. The current files include a Python script (`IGC.py`) and a Jupyter Notebooks (`IGC_example.ipynb` and 'IGC_with_DM_example.ipynb') that demonstrate key methodologies introduced in the research.  
+
 
 ## Overview
 
@@ -43,6 +44,10 @@ If you use this code in your work, please cite the paper as follows (citation de
 June Sic Kim, "A novel approach for brain connectivity using recurrent neural networks and integrated gradients," Computers in Biology and Medicine, 2025, 184:109404.
 ```
 https://doi.org/10.1016/j.compbiomed.2024.109404
+```
+June Sic Kim, "Dynamic memory-enhanced recurrent neural networks with temporal attention for robust long-range connectivity inference," Neuroimage, 2026 in press
+```
+https://doi.org/10.1016/j.neuroimage.2026.122068
 
 ## Contributing
 
