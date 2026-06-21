@@ -2,10 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import pytorch_model_summary
 import copy
 from scipy import stats
+import time
 import matplotlib.pyplot as plt
 
 def simulate_data_random(ch, conn, noise_level, order=5, nonlinear=False, fixed_weight=False, sn=10000):
@@ -31,11 +30,14 @@ def simulate_data_random(ch, conn, noise_level, order=5, nonlinear=False, fixed_
         if fixed_weight is False:
           weight=torch.rand(order)*4-2
           weights.append(weight)
+        """
         for i in range(order, sn):
           if nonlinear:
             x[i,nodes[1]]+=torch.sum([wei*x[i-a-1,nodes[0]]**(order-a) for a, wei in enumerate(weight)])
           else:
             x[i,nodes[1]]+=torch.sum(weight*x[i-order:i,nodes[0]].flip(0))
+        """
+        x[order:,nodes[1]]+=F.conv1d(x[:,nodes[0]].reshape(1,1,-1), weight.flip(-1).reshape(1,1,-1))[0,0,:-1]
     return x+noise*noise_level, weights
 
 def simulate_data_random_with_weights(ch, conn, noise_level, weights, sn=10000):
@@ -59,7 +61,7 @@ def simulate_data_random_with_weights(ch, conn, noise_level, weights, sn=10000):
     return x+noise*noise_level
 
 def multivariate_data(dataset, target, start_index, end_index, history_size,
-                      target_size, step, single_step=False):
+                      target_size, step, single_step=True):
     data=[]
     labels=[]
     start_index=start_index+history_size
@@ -77,7 +79,7 @@ def multivariate_data(dataset, target, start_index, end_index, history_size,
     else:
         return np.array(data), np.array(labels)
 
-def get_gradients(model, inputs):
+def get_gradients(model, inputs, verbose=True):
     model.train(True)
     for out_n in model.parameters():
         model_outsize=out_n.shape
@@ -92,8 +94,8 @@ def get_gradients(model, inputs):
             y_part.backward(retain_graph=True)
             #igs[:,:,i]+=interp_input.grad.squeeze()
             grads[interp_num,:,:,i]=interp_input.grad.squeeze()
-        print('.', end='')
-    print(f'\n{len(inputs)} gradients were collected')
+        if verbose: print('.', end='')
+    print(f'{len(inputs)} gradients were collected')
 
     return grads
 
@@ -178,6 +180,68 @@ def get_integrated_gradients(model, x, baseline=None, num_grads=20, side=2, verb
 
     return igs
 
+def get_integrated_gradients_separate(model, x, baseline=None, num_grads=20, side=2, verbose=True):
+    """
+    igs = get_integrated_gradients(model, x, baseline=None, num_grads=100)
+    model    : pytorch DNN model
+    x        : reference input
+    baseline : default (None) indicates 0
+    num_grads: number of gradient steps from baseline to the reference input
+    side     : if 1, only uses positive values (ex: images, min-max normalized signals)
+               if 2, uses both of negative and positive values separately and merges both values
+    """
+    if baseline is None:
+        baseline = torch.zeros(x.shape).float()
+    else:
+        baseline=baseline.float()
+    
+    # 1. Interpolation to reconstruct step inputs
+    x=x.float()
+    M=x.shape[-1]
+    inputs1=[]
+    inputs2=[]
+    for inp in range(M):
+        x_p=torch.zeros_like(x)
+        x_p[:,inp]=x[:,inp]
+        for step in range(1,num_grads+1):
+            interpolated_signal1=(baseline+(step/num_grads)*(x_p-baseline)).unsqueeze(0).clone().detach()
+            interpolated_signal1.requires_grad_(True)
+            inputs1.append(interpolated_signal1)
+            if side==2:
+                interpolated_signal2=(baseline+(step/num_grads)*(-x_p-baseline)).unsqueeze(0).clone().detach()
+                interpolated_signal2.requires_grad_(True)
+                inputs2.append(interpolated_signal2)
+    
+    # 2. Remove random effects from the model
+    n_model = copy.deepcopy(model)
+    for child in n_model.children():
+        if isinstance(child, nn.Dropout):
+            child.p = 0
+    
+    # 3. Get gradients
+    #grads1=get_gradients(n_model, inputs1, verbose=verbose)
+    grads1=get_gradients_VF(n_model, inputs1, verbose=verbose)
+    # Gather corresponding inputs and outputs
+    grads1 = grads1.view(M,num_grads,x.shape[-2],M,M).diagonal(dim1=0,dim2=3).transpose(-1,-2)
+    # Approximate the integral using the trapezoidal rule
+    grads1 = (grads1[:-1] + grads1[1:]) / 2.0
+    # 4. Calculate integrated gradients
+    igs1 = (x - baseline).squeeze().unsqueeze(2).repeat(1,1,grads1.shape[-1]) * grads1.mean(0)
+
+    if side==2:
+        # For negative activity (Repeat 3~4)
+        #grads2=get_gradients(n_model, inputs2, verbose=verbose)
+        grads2=get_gradients_VF(n_model, inputs2, verbose=verbose)
+        grads2 = grads2.view(M,num_grads,x.shape[-2],M,M).diagonal(dim1=0,dim2=3).transpose(-1,-2)
+        grads2 = (grads2[:-1] + grads2[1:]) / 2.0
+        igs2 = (-x - baseline).squeeze().unsqueeze(2).repeat(1,1,grads2.shape[-1]) * grads2.mean(0)
+    
+        igs=(igs1-igs2)/2
+    else:
+        igs = igs1
+
+    return igs
+
 def ig_connectivity(x, model=None, order=20, num_grads=50, foi=torch.arange(0,100,5), sfreq=1000, stat='np', nrs=0, side=2, device=None):
     """
     Integrated Gradients connectivity
@@ -228,10 +292,9 @@ def ig_connectivity(x, model=None, order=20, num_grads=50, foi=torch.arange(0,10
         x_test = x_test.float()
         y_test = y_test.float()
         model = MVAR_biLSTM(x.shape[-1], [200, 200, 200], 1, x.shape[-1]).to(device)
-        hist = train_model(model, (x_train, y_train), (x_test, y_test), num_epochs=50, device=device)
+        train_model(model, (x_train, y_train), (x_test, y_test), num_epochs=50, device=device)
         # Use a trained model
         # Validation of model fitting
-        #pred_y=model(x_train.to(device))
         pred_y = evaluate_testset(model, (x_train,y_train))
         corr_train=torch.corrcoef(torch.concatenate(
             (pred_y.reshape(1,-1),y_train.reshape(1,-1)),axis=0))
@@ -319,24 +382,27 @@ class MVAR_biLSTM(nn.Module):
         super(MVAR_biLSTM, self).__init__() # 상속한 nn.Module에서 RNN에 해당하는 init 실행
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm1 = nn.LSTM(input_size, hidden_size, num_layers, bidirectional=True, batch_first=True)
-        self.dropout1 = nn.Dropout(0.2)
-        self.bnorm1 = nn.BatchNorm1d(hidden_size*2)
-        self.fc1 = nn.Linear(int(hidden_size*2), hidden_size)
-        self.dropout3 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(hidden_size, num_outputs)
+        self.lstm1 = nn.LSTM(input_size, hidden_size[0], num_layers, bidirectional=True, batch_first=True)
+        self.dropout1 = nn.Dropout(0.3)
+        self.lstm2 = nn.LSTM(int(hidden_size[0]*2), hidden_size[1], num_layers, bidirectional=True)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(int(hidden_size[1]*2), hidden_size[2])
+        self.dropout3 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(hidden_size[2], num_outputs)
 
     def forward(self, x): 
         # input x : (BATCH, LENGTH, INPUT_SIZE) 입니다 (다양한 length를 다룰 수 있습니다.).
         self.lstm1.flatten_parameters()
-        out, _ = self.lstm1(x) # output : (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE) tensors. 
-                               # We don't need (hn, cn)
+        self.lstm2.flatten_parameters()
+        out, _ = self.lstm1(x) # output : (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE) tensors. (hn, cn)은 필요 없으므로 받지 않고 _로 처리합니다. 
         out    = F.tanh(out)
         out    = self.dropout1(out)
-        out    = self.bnorm1(out.transpose(1,2)).transpose(1,2)
-        # Extract the last time step(sequence length)
-        out    = self.fc1(out[:,-1,:])
+        out, _ = self.lstm2(out)
         out    = F.tanh(out)
+        out    = self.dropout2(out)
+        # 마지막 time step(sequence length)의 hidden state를 사용해 Class들의 logit을 반환합니다(hidden_size -> num_classes). 
+        out    = self.fc1(out[:,-1,:])
+        out    = F.relu(out)
         out    = self.dropout3(out)
         out    = self.fc2(out)
         
@@ -390,6 +456,11 @@ def train_model(model, trainset, testset=[], num_epochs=50, lr=0.001, n_batch=51
             loss.backward()
             optimizer.step()
             avg_cost += loss.item()/total_batch
+            if (i+1)%10 == 0 and verbose:
+                print(f"\r{i+1}/{total_batch}",end=' ')
+                progress = int((i+1)/total_batch*100)
+                for i in range(progress): print('.',end='')
+        if verbose: print("")
         train_hist = np.append(train_hist, avg_cost)
 
         if len(testset)>0:
@@ -480,6 +551,19 @@ def evaluation_corr(model, X, nbatch=512, device=None):
         corr[i]=torch.corrcoef(torch.stack((y_pred[:,i].cpu(),y[:,i].cpu()),1).T)[0,1]
     return corr_total, corr
 
+def evaluation_linear(model, x, y, nbatch=512, device=None):
+    y_pred=torch.zeros(0,y.shape[1])
+    model.eval()
+    for i in range(int(np.ceil(x.shape[0]/nbatch))):
+        x_batch=x[i*nbatch:(i+1)*nbatch,:,:].transpose(1,2).flip(2).reshape(-1,x.shape[1]*x.shape[2])
+        y_pred=torch.cat((y_pred,
+            torch.matmul(model.reshape(-1,model.shape[1]*model.shape[2]),x_batch.T).T),dim=0)
+    corr_total=torch.corrcoef(torch.stack((y_pred.reshape(-1),y.reshape(-1)),1).T)[0,1]
+    corr=torch.zeros(y.shape[-1])
+    for i in range(y.shape[-1]):
+        corr[i]=torch.corrcoef(torch.stack((y_pred[:,i],y[:,i]),1).T)[0,1]
+    return corr_total, corr
+
 def display_conn_spectrum(conn, frq=None, title='', yscale=1.0, thresh=0):
     """
     Display connectivity spectrum for DTF, PDC, and IGC
@@ -507,13 +591,14 @@ def display_conn_spectrum(conn, frq=None, title='', yscale=1.0, thresh=0):
             if y<nch-1:
                 axs[y,x].set_xticklabels([])
             else:
-                axs[y,x].set_xticklabels(frq[0:-1:np.int32(frq.size/5)])
-            axs[y,x].set_yticks(np.arange(0,yscale+1/3,1/2))
+                axs[y,x].set_xticklabels(frq[0:-1:np.int32(frq.size/5)], rotation=45)
+            axs[y,x].set_yticks(np.arange(0,yscale+1/3,yscale/2))
             if x>0:
                 axs[y,x].set_yticklabels([])
             else:
-                axs[y,x].set_yticklabels(labels=np.arange(0,yscale+1/3,1/2))
+                axs[y,x].set_yticklabels(labels=np.arange(0,yscale+1/3,yscale/2).round(1))
             axs[y,x].set_title('%d→%d' %(x+1,y+1))
+    plt.show()
 
     return fig
 
@@ -528,26 +613,272 @@ def display_connectivity(conn, title='', vmin=0.0, vmax=1.0, labels=[]):
             labels = range(1,nch+1)
         if not isinstance(title,list) and not isinstance(title,tuple):
             title=[title for i in range(len(conn))]
+        FONT_SCALE=conn[0].shape[-1]/10
         fig, axs = plt.subplots(1, len(conn), sharey=True)
-        fig.set_size_inches(4+2*len(conn),10)
+        fig.set_size_inches((4+2*len(conn))*FONT_SCALE,10*FONT_SCALE)
         for i, (con, subtitle) in enumerate(zip(conn, title)):
             mapper=axs[i].pcolor(labels, labels, con, shading='nearest', 
                                  vmin=vmin, vmax=vmax, cmap='gist_heat_r')
             axs[i].axis('image')
             axs[i].set_xticks(np.arange(1,1+con.shape[0], np.ceil(con.shape[0]/10), dtype=int))
-            axs[i].set_xticklabels(range(1, nch+1, int(np.ceil(nch/10))), rotation=45)
-            axs[i].set_xlabel('From')
-            axs[i].set_title(subtitle)
-        axs[0].set_ylabel('To')
+            axs[i].set_xticklabels(range(1, nch+1, int(np.ceil(nch/10))), rotation=45, fontsize=7*FONT_SCALE)
+            axs[i].set_xlabel('From', fontsize=10*FONT_SCALE)
+            axs[i].set_title(subtitle, fontsize=10*FONT_SCALE)
+        axs[0].set_yticks(np.arange(1,1+con.shape[0], np.ceil(con.shape[0]/10), dtype=int))
+        axs[0].set_yticklabels(range(1, nch+1, int(np.ceil(nch/10))), fontsize=7*FONT_SCALE)
+        axs[0].set_ylabel('To', fontsize=10*FONT_SCALE)
         fig.colorbar(mapper, ax=axs, shrink=1/(len(conn)/2+2.5))
+        #fig.show()
     else:
         nch = conn.shape[0]
         if len(labels)!=nch:
             labels = range(1,nch+1)
         plt.pcolor(labels, labels, conn, shading='nearest', vmin=vmin, vmax=vmax, cmap='gist_heat_r')
-        plt.xticks(rotation=45)
-        plt.xlabel('From')
-        plt.ylabel('To')
+        plt.xticks(np.arange(1,1+con.shape[0], np.ceil(con.shape[0]/10), dtype=int), rotation=45)
+        plt.xticklabels(range(1, nch+1, int(np.ceil(nch/10))), rotation=45, fontsize=7*FONT_SCALE)
+        plt.yticks(np.arange(1,1+con.shape[0], np.ceil(con.shape[0]/10), dtype=int))
+        plt.yticklabels(range(1, nch+1, int(np.ceil(nch/10))), fontsize=7*FONT_SCALE)
+        plt.xlabel('From', fontsize=10*FONT_SCALE)
+        plt.ylabel('To', fontsize=10*FONT_SCALE)
         plt.colorbar()
-        plt.title(title)
+        plt.title(title, fontsize=10*FONT_SCALE)
     plt.show()
+
+# rank correlation
+# x=[N, P], Y=[N, Q]
+# P and Q are number of features
+# N is the number of samples
+# output dimension is [P, Q]
+def corr(x, y=None):
+    if y is None:
+        y = x
+    # 벡터화된 방식으로 상관계수 계산
+    x_mean = x.mean(dim=0, keepdim=True)
+    y_mean = y.mean(dim=0, keepdim=True)
+    x_centered = x - x_mean
+    y_centered = y - y_mean
+
+    x_std = x_centered.std(dim=0, keepdim=True)
+    y_std = y_centered.std(dim=0, keepdim=True)
+
+    covariance = torch.matmul(x_centered.T, y_centered) / (x.shape[0] - 1)
+    correlation = covariance / (x_std.T @ y_std)
+    return correlation
+
+# Parameter estimation using Yule Walker Equation
+# x.shape should be Nsamples X Nfeatures
+def yule_walker(x, order, flat=False):
+    M=x.shape[1] # number of features
+    N=x.shape[0] # number of samples
+    r=torch.zeros(M,M,order+1)
+    R=torch.zeros(M*order,M*order)
+    rr=torch.zeros(M*order,M)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for i in range(0, order+1):
+        r[:,:,i]=corr(x[:N-order,:], x[i:N-order+i,:])
+    for a in range(order):
+        for b in range(order):
+            R[M*a:M*(a+1), M*b:M*(b+1)]=r[:,:,abs(a-b)]
+        rr[M*a:M*(a+1),:]=r[:,:,a+1].T
+    A=torch.matmul(torch.linalg.inv(R), rr)
+    AA=torch.zeros(M,M,order)
+    for i in range(order):
+        AA[:,:,i]=A[M*i:M*(i+1),:]
+    end.record()
+    torch.cuda.synchronize()
+    print('Computation time for linear regression: %.3fs' %(start.elapsed_time(end)/1000))
+    return A if flat else AA
+
+def yule_walker_VF(x, order, flat=False):
+    M = x.shape[1]  # number of features
+    N = x.shape[0]  # number of samples
+    r = torch.zeros(M, M, order + 1)
+    R = torch.zeros(M * order, M * order)
+    rr = torch.zeros(M * order, M)
+
+    start = time.time()
+
+    # 전체 cross-correlation을 벡터화된 방식으로 계산
+    x_subs = [x[i:N-order+i, :] for i in range(order+1)]
+    x_stack = torch.stack(x_subs, dim=0)  # (order+1, N-order, M)
+
+    # 벡터화된 corr 계산
+    x0 = x_stack[0].T  # 기준 데이터 (M, N-order)
+    x_means = x_stack.mean(dim=1, keepdim=True)  # (order+1, 1, M)
+    x_stds = x_stack.std(dim=1, keepdim=True)  # (order+1, 1, M)
+    x_centered = x_stack - x_means  # (order+1, N-order, M)
+
+    # x0와 각 시점 데이터 간의 covariance 계산
+    covariances = torch.einsum('ij,kjl->kil', x0, x_centered) / (N - order - 1)  # (order+1, M, M)
+    x0_std = x_centered[0].std(dim=0, keepdim=True)  # (1, M)
+    #correlation_matrices = covariances / (x0_std.T @ x_stds.squeeze(1))  # (order+1, M, M)
+    correlation_matrices = covariances / torch.einsum('ij,kjl->kil', x0_std.T, x_stds)  # (order+1, M, M)
+
+    r = correlation_matrices  # (order+1, M, M)
+
+    # R와 rr를 벡터화하여 계산
+    indices = torch.arange(order).repeat(order, 1)  # (order, order)
+    abs_diff = torch.abs(indices - indices.T)  # |a-b| 계산 (order, order)
+    # R 행렬 계산: r[|a-b|]로부터 블록 생성
+    R_blocks = r[abs_diff]  # (order, order, M, M)
+    R = R_blocks.permute(0, 2, 1, 3).reshape(M * order, M * order)
+    # rr 행렬 계산
+    rr_blocks = r[1:order+1]  # r[a+1] 가져오기 (order, M, M)
+    rr = rr_blocks.permute(0, 2, 1).reshape(M * order, M)
+
+    # A 행렬 계산
+    A = torch.linalg.solve(R, rr)
+    AA= A.permute(1,0).reshape([M,order,M]).permute(2,0,1)
+
+    print('Computation time for linear regression: %.3fs' % (time.time() - start))
+    return A if flat else AA
+
+def DTF(A, sfreq=1000, foi=torch.arange(0,100,5), normalized=False):
+    order=A.shape[2]
+    M=A.shape[0]
+    Af=torch.zeros(size=(M,M,len(foi)), dtype=torch.complex64)
+    Aff=torch.zeros(size=(M,M,len(foi)), dtype=torch.complex64)
+    for f_ind, f in enumerate(foi):
+        for i in range(order):
+            Af[:,:,f_ind]=Af[:,:,f_ind]+A[:,:,i]*torch.exp(-1j*2*torch.pi*f*i/sfreq)
+        Aff[:,:,f_ind]=torch.eye(M)-Af[:,:,f_ind]
+    dtf=torch.zeros(size=(M,M,len(foi)))
+    for f in range(len(foi)):
+        tmp=torch.abs(torch.linalg.inv(Aff[:,:,f]))
+        dtf[:,:,f]=tmp/torch.sqrt(torch.diag(torch.matmul(torch.matmul(
+            tmp,torch.eye(M)),tmp.T))).unsqueeze(1).repeat(1,tmp.shape[1])
+    pdc=torch.zeros(size=(M,M,len(foi)))
+    for f in range(len(foi)):
+        tmp=torch.abs(Aff[:,:,f])
+        pdc[:,:,f]=tmp/torch.sqrt(torch.diag(torch.matmul(torch.matmul(
+            tmp.T,torch.eye(M)),tmp))).unsqueeze(1).repeat(1,Aff.shape[1]).T
+
+    return dtf, pdc
+
+def evaluate_connectivity_with_hitmap(con_mat, con_org, diag=False):
+    M=con_mat.shape[0]
+    con_thresh = con_mat.clone().detach()
+    con_thresh = torch.where(con_thresh>0, 1.0, 0.0)
+    if diag==False:
+        con_thresh=torch.diagonal_scatter(con_thresh, torch.zeros(M), 0)
+    recall=torch.sum(con_thresh*con_org)/torch.sum(con_org)
+    precision=torch.sum(con_thresh*con_org)/torch.sum(con_thresh)
+    accuracy=(torch.sum(torch.abs(con_thresh-1+con_org))-M) / (M*(M-1))
+    F1=2*recall*precision/(recall+precision)
+    performance={'recall': recall, 'precision': precision,
+                 'accuracy': accuracy, 'F1': F1}
+    
+    return performance
+
+class MVAR_biLSTM_simple(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_outputs):
+        super(MVAR_biLSTM_simple, self).__init__() # 상속한 nn.Module에서 RNN에 해당하는 init 실행
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm1 = nn.LSTM(input_size, hidden_size[0], num_layers, bidirectional=True, batch_first=True)
+        self.dropout1 = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(int(hidden_size[0]*2), hidden_size[1])
+        self.dropout3 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(hidden_size[1], num_outputs)
+
+    def forward(self, x): 
+        # input x : (BATCH, LENGTH, INPUT_SIZE) 입니다 (다양한 length를 다룰 수 있습니다.).
+        self.lstm1.flatten_parameters()
+        out, _ = self.lstm1(x) # output : (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE) tensors. (hn, cn)은 필요 없음
+        out    = F.tanh(out)
+        out    = self.dropout1(out)
+        # 마지막 time step(sequence length)의 hidden state를 사용
+        out    = self.fc1(out[:,-1,:])
+        out    = F.tanh(out)
+        out    = self.dropout3(out)
+        out    = self.fc2(out)
+        
+        return out
+
+from typing import Tuple, Optional
+class DM_LSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, seq_len, layer_dim=1, bidirectional=False, bias=True, device=None):
+        super(DM_LSTM, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.seq_len = seq_len
+        self.layer_dim = layer_dim
+        self.bias = bias
+        self.lstm_cell = nn.LSTMCell(input_size, hidden_size, bias, device=device)
+        self.dm = nn.Parameter(torch.zeros(size=(seq_len, input_size, hidden_size)))
+        self.dmb= nn.Parameter(torch.zeros(hidden_size))
+        if bidirectional:
+            self.lstm_rcell = nn.LSTMCell(input_size, hidden_size, bias, device=device)
+        self.bidirectional = bidirectional
+        self.reset_parameters()
+        self.device = device
+        
+    def reset_parameters(self):
+        self.dm.data.zero_()
+        self.dmb.data.zero_()
+
+    def forward(self, x, hidden:Optional[Tuple[torch.Tensor, torch.Tensor]]=None)->torch.Tensor:
+        if self.device is None:
+            self.device=next(self.lstm_cell.parameters()).device
+        device=x.device
+        
+        if hidden is None:
+            h0 = torch.zeros(x.size(0), self.hidden_size).to(device)
+            c0 = torch.zeros(x.size(0), self.hidden_size).to(device)
+        else:
+            h0, c0 = hidden[0], hidden[1]
+        
+        if x.size(1)!=self.seq_len:
+            print('Error: LSTM sequence length and input size are not matched')
+            return torch.tensor([])
+        
+        outs  = torch.zeros([x.size(0), self.seq_len, self.hidden_size], device=device)
+        outrs = torch.zeros(0)
+        cn = c0[:,:]
+        hn = h0[:,:]
+        if self.bidirectional:
+            outrs = torch.zeros([x.size(0), self.seq_len, self.hidden_size], device=device)
+        cnr = c0[:,:]
+        hnr = h0[:,:]
+
+        # input: (batch, seq, input) ==> (seq, batch, input)
+        # dm   : (seq, input, hidden)
+        dhn = torch.matmul(torch.permute(x,(1,0,2)), self.dm)
+        for seq in range(self.seq_len):
+            hn, cn = self.lstm_cell(x[:, seq, :], (hn, cn))
+            dout = dhn[seq] + self.dmb
+            # dw linear layer는 batchxseq_len 으로 flatten 되어 있으므로,
+            # seq_len 만큼 뛰어넘어가며 seq별 출력 데이터를 모아야 한다.
+            hn = hn + F.tanh(dout)
+            if self.bidirectional:
+                seqr = self.seq_len-1-seq
+                hnr, cnr = self.lstm_rcell(x[:, seqr, :], (hnr, cnr))
+                dout = dhn[seqr] + self.dmb
+                # reverse 방향으로 출력 데이터 취합
+                hnr = hnr + F.tanh(dout)
+                outrs[:,seq,:]=hnr
+            outs[:,seq,:]=hn
+        
+        return torch.cat((outs, outrs), dim=-1)
+
+class MVAR_DMLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, seq_len, num_layers, num_outputs):
+        super(MVAR_DMLSTM, self).__init__() # 상속한 nn.Module에서 RNN에 해당하는 init 실행
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm1 = DM_LSTM(input_size, hidden_size[0], seq_len, num_layers, bidirectional=True)
+        self.fc1 = nn.Linear(int(hidden_size[0]*2), hidden_size[1])
+        self.fc2 = nn.Linear(hidden_size[1], num_outputs)
+
+    def forward(self, x): 
+        # input x : (BATCH, LENGTH, INPUT_SIZE) 입니다 (다양한 length를 다룰 수 있습니다.).
+        out    = self.lstm1(x) # output : (BATCH_SIZE, SEQ_LENGTH, HIDDEN_SIZE) tensors. (hn, cn)은 필요 없음
+        out    = F.tanh(out)
+        # hidden state of the last time step(sequence length)
+        out    = self.fc1(out[:,-1,:])
+        out    = F.tanh(out)
+        out    = self.fc2(out)
+        
+        return out
